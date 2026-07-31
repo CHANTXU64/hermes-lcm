@@ -323,6 +323,8 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("deferred_maintenance_max_passes", "LCM_DEFERRED_MAINTENANCE_MAX_PASSES", int),
     _EnvFieldSpec("critical_budget_pressure_ratio", "LCM_CRITICAL_BUDGET_PRESSURE_RATIO", float),
     _EnvFieldSpec("threshold_full_sweep_enabled", "LCM_THRESHOLD_FULL_SWEEP_ENABLED", bool),
+    _EnvFieldSpec("threshold_only_compaction_enabled", "LCM_THRESHOLD_ONLY_COMPACTION_ENABLED", bool),
+    _EnvFieldSpec("post_compaction_target_ratio", "LCM_POST_COMPACTION_TARGET_RATIO", float),
     _EnvFieldSpec("summary_prefix_target_tokens", "LCM_SUMMARY_PREFIX_TARGET_TOKENS", int),
     _EnvFieldSpec("l2_budget_ratio", "LCM_L2_BUDGET_RATIO", float),
     _EnvFieldSpec("l3_truncate_tokens", "LCM_L3_TRUNCATE_TOKENS", int),
@@ -396,6 +398,7 @@ _SOURCE_TRACKED_ENV_FIELDS = frozenset({
     "fresh_tail_max_tokens",
     "leaf_chunk_tokens",
     "context_threshold",
+    "post_compaction_target_ratio",
     "summary_spend_max_calls",
     "summary_spend_window_seconds",
     "summary_spend_backoff_seconds",
@@ -455,6 +458,10 @@ class LCMConfig:
     critical_budget_pressure_ratio: float = 0.0
     # Opt into one bounded synchronous sweep after threshold pressure is reached.
     threshold_full_sweep_enabled: bool = False
+    # Suppress automatic summary-producing maintenance below context_threshold.
+    threshold_only_compaction_enabled: bool = False
+    # Best-effort whole provider-request target after a threshold sweep.
+    post_compaction_target_ratio: float = 0.0
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
 
@@ -712,6 +719,10 @@ class LCMConfig:
             default_source=context_source,
         )
         _record("context_threshold", source, warning)
+        c.post_compaction_target_ratio, source, warning = _parse_float_env_with_source(
+            "LCM_POST_COMPACTION_TARGET_RATIO", c.post_compaction_target_ratio
+        )
+        _record("post_compaction_target_ratio", source, warning)
         c.codex_gpt55_autoraise_enabled, source = _hermes_codex_gpt55_autoraise_with_source(
             c.codex_gpt55_autoraise_enabled
         )

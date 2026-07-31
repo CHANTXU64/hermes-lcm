@@ -16,6 +16,7 @@ lifecycle) through normal attribute lookup. ``LCMEngine`` mixes this in ahead of
 from __future__ import annotations
 
 import logging
+import math
 import time
 from typing import Any, Dict, List, Optional
 
@@ -31,6 +32,60 @@ _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
+    def _threshold_full_sweep_policy_enabled(self) -> bool:
+        return bool(
+            self._config.threshold_full_sweep_enabled
+            or self._config.threshold_only_compaction_enabled
+        )
+
+    def _threshold_only_blocks_summary_maintenance(self, observed_tokens: int) -> bool:
+        return bool(
+            self._config.threshold_only_compaction_enabled
+            and self.threshold_tokens > 0
+            and observed_tokens < self.threshold_tokens
+        )
+
+    def _post_compaction_target_tokens(self) -> int:
+        ratio = float(self._config.post_compaction_target_ratio)
+        if (
+            not math.isfinite(ratio)
+            or ratio <= 0
+            or ratio >= 1
+            or self.context_length <= 0
+            or self.threshold_tokens <= 0
+        ):
+            return 0
+        target_tokens = max(1, int(self.context_length * ratio))
+        return target_tokens if target_tokens < self.threshold_tokens else 0
+
+    def _fixed_request_overhead(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: Optional[int],
+        post_compaction_target_tokens: int,
+    ) -> tuple[int, bool, str]:
+        """Return request tokens not represented by the original message list."""
+        message_tokens = count_messages_tokens(messages)
+        if current_tokens is not None and current_tokens > 0:
+            return (
+                max(0, current_tokens - message_tokens),
+                True,
+                "current_tokens_minus_original_messages",
+            )
+
+        # Without Hermes' whole-request estimate, treat all unobserved context
+        # headroom as fixed overhead and never report an exact target hit.
+        conservative_request_tokens = (
+            self.context_length
+            if self.context_length > 0
+            else post_compaction_target_tokens
+        )
+        return (
+            max(0, conservative_request_tokens - message_tokens),
+            False,
+            "conservative_unobserved_context_headroom",
+        )
+
     def _maybe_reclassify_late_auxiliary_before_compaction_write(self) -> None:
         maybe_reclassify = getattr(
             self,
@@ -95,7 +150,7 @@ class CompactionMixin:
         ):
             eligible, reason = self._leaf_compaction_candidate_status(
                 messages,
-                allow_partial_leaf=self._config.threshold_full_sweep_enabled,
+                allow_partial_leaf=self._threshold_full_sweep_policy_enabled(),
             )
             pre_ingest_placeholder_ambiguous_noop = not eligible
             pre_ingest_noop_reason = reason
@@ -149,10 +204,16 @@ class CompactionMixin:
                 self._last_compression_noop_reason = pre_ingest_noop_reason
                 logger.info("LCM preflight compression no-op: %s", pre_ingest_noop_reason)
                 return False
+            if self._threshold_only_blocks_summary_maintenance(replay_rough):
+                self._refresh_raw_backlog_debt(
+                    replay_messages,
+                    observed_tokens=replay_rough,
+                )
+                return False
             eligible, reason = self._leaf_compaction_candidate_status(
                 replay_messages,
                 allow_partial_leaf=bool(
-                    self._config.threshold_full_sweep_enabled
+                    self._threshold_full_sweep_policy_enabled()
                     and self.threshold_tokens > 0
                     and replay_rough >= self.threshold_tokens
                 ),
@@ -184,7 +245,7 @@ class CompactionMixin:
                 return False
             eligible, reason = self._leaf_compaction_candidate_status(
                 messages,
-                allow_partial_leaf=self._config.threshold_full_sweep_enabled,
+                allow_partial_leaf=self._threshold_full_sweep_policy_enabled(),
             )
             if eligible:
                 return self._mark_preflight_compression_requested()
@@ -197,6 +258,8 @@ class CompactionMixin:
             logger.info("LCM preflight compression no-op: %s", reason)
             return False
         self._refresh_raw_backlog_debt(messages, observed_tokens=rough)
+        if self._threshold_only_blocks_summary_maintenance(rough):
+            return False
         if self._should_run_deferred_maintenance(messages, observed_tokens=rough):
             return self._mark_preflight_compression_requested()
         return False
@@ -461,16 +524,61 @@ class CompactionMixin:
         leaf_compacted_this_turn = False
         dropped_replayed_scaffold_messages = False
         leaf_passes = 0
-        estimated_active_tokens = (
+        original_message_tokens = count_messages_tokens(messages)
+        estimated_compaction_tokens = (
             observed_prompt_tokens
             if observed_prompt_tokens is not None and observed_prompt_tokens > 0
-            else count_messages_tokens(messages)
+            else original_message_tokens
         )
+        post_compaction_target_tokens = self._post_compaction_target_tokens()
+        (
+            fixed_request_overhead_tokens,
+            fixed_request_overhead_known,
+            fixed_request_overhead_source,
+        ) = self._fixed_request_overhead(
+            messages,
+            observed_prompt_tokens,
+            post_compaction_target_tokens,
+        )
+        estimated_provider_request_tokens = max(
+            estimated_compaction_tokens,
+            original_message_tokens + fixed_request_overhead_tokens,
+        )
+        proactive_recall_budget_tokens = (
+            max(0, int(self._config.proactive_recall_budget_tokens or 0))
+            if self._config.proactive_recall_enabled
+            else 0
+        )
+        if (
+            not force
+            and not force_overflow
+            and self._threshold_only_blocks_summary_maintenance(
+                estimated_compaction_tokens
+            )
+        ):
+            self._refresh_raw_backlog_debt(
+                working_messages,
+                observed_tokens=observed_prompt_tokens,
+            )
+            sanitized_messages = self._sanitize_active_context_messages(
+                working_messages,
+                insert_missing_tool_stubs=False,
+            )
+            if sanitized_messages != messages:
+                self._ingest_cursor = len(sanitized_messages)
+                self._last_compression_status = "sanitized"
+                self._last_compression_noop_reason = ""
+            else:
+                self._last_compression_status = "noop"
+                self._last_compression_noop_reason = (
+                    "threshold-only policy defers summary maintenance below threshold"
+                )
+            return sanitized_messages
         threshold_full_sweep_active = bool(
-            self._config.threshold_full_sweep_enabled
+            self._threshold_full_sweep_policy_enabled()
             and not force_overflow
             and self.threshold_tokens > 0
-            and estimated_active_tokens >= self.threshold_tokens
+            and estimated_compaction_tokens >= self.threshold_tokens
         )
         sweep_deadline = time.monotonic() + _THRESHOLD_FULL_SWEEP_MAX_SECONDS
         configured_sweep_target = int(self._config.summary_prefix_target_tokens)
@@ -490,11 +598,20 @@ class CompactionMixin:
                 "condensation_passes": 0,
                 "total_passes": 0,
                 "duration_ms": 0.0,
-                "tokens_before": estimated_active_tokens,
-                "tokens_after": estimated_active_tokens,
+                "token_semantics": "estimated_whole_provider_request",
+                "tokens_before": estimated_provider_request_tokens,
+                "tokens_after": estimated_provider_request_tokens,
+                "assembled_message_tokens_before": original_message_tokens,
+                "assembled_message_tokens_after": original_message_tokens,
+                "fixed_request_overhead_tokens": fixed_request_overhead_tokens,
+                "fixed_request_overhead_known": fixed_request_overhead_known,
+                "fixed_request_overhead_source": fixed_request_overhead_source,
+                "proactive_recall_budget_tokens": proactive_recall_budget_tokens,
                 "summary_prefix_tokens_before": sweep_summary_prefix_before,
                 "summary_prefix_tokens_after": sweep_summary_prefix_before,
                 "summary_prefix_target_tokens": sweep_target_tokens,
+                "post_compaction_target_ratio": self._config.post_compaction_target_ratio,
+                "post_compaction_target_tokens": post_compaction_target_tokens,
                 "stop_reason": "",
                 "budget_exhausted": False,
             }
@@ -521,9 +638,41 @@ class CompactionMixin:
 
         explicit_focus_topic = focus_topic is not None
 
+        def assemble_working_context(
+            *,
+            for_measurement: bool = False,
+        ) -> List[Dict[str, Any]]:
+            leading_anchor_count = self._leading_anchor_count(working_messages)
+            anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
+            self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
+            try:
+                kwargs: dict[str, Any] = {
+                    "assembly_cap_override": recovery_assembly_cap,
+                }
+                if for_measurement:
+                    kwargs["for_measurement"] = True
+                return self._assemble_context(
+                    working_messages[0] if leading_anchor_count else None,
+                    working_messages[leading_anchor_count:],
+                    **kwargs,
+                )
+            finally:
+                self._pending_context_anchor_messages = None
+
+        def measure_provider_request_tokens() -> int:
+            assembled_message_tokens = count_messages_tokens(
+                assemble_working_context(for_measurement=True)
+            )
+            return (
+                assembled_message_tokens
+                + fixed_request_overhead_tokens
+                + proactive_recall_budget_tokens
+            )
+
         noop_reason = "no eligible raw backlog outside fresh tail"
         sweep_stop_reason = ""
         sweep_raw_drained = False
+        compressed = None
         dependent_reply_message_ids: set[int] = set()
         preexisting_dependent_reply_records = self._load_generated_ignored_dependent_reply_records()
 
@@ -796,9 +945,25 @@ class CompactionMixin:
             pressure_messages = pressure_messages[:leading_anchor_count] + pressure_remaining_messages
             leaf_compacted_this_turn = True
             leaf_passes += 1
-            estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)
+            estimated_provider_request_tokens = max(
+                0,
+                estimated_provider_request_tokens - source_tokens + summary_tokens,
+            )
+            estimated_compaction_tokens = max(
+                0,
+                estimated_compaction_tokens - source_tokens + summary_tokens,
+            )
 
             if threshold_full_sweep_active:
+                if post_compaction_target_tokens > 0:
+                    estimated_provider_request_tokens = measure_provider_request_tokens()
+                    if (
+                        fixed_request_overhead_known
+                        and estimated_provider_request_tokens
+                        <= post_compaction_target_tokens
+                    ):
+                        sweep_stop_reason = "post_compaction_target_reached"
+                        break
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 remaining_fresh_tail_start = self._fresh_tail_start(pressure_messages)
                 remaining_raw = working_messages[
@@ -814,7 +979,11 @@ class CompactionMixin:
                 break
 
             if not force_overflow:
-                if (not deferred_maintenance_active) and self.threshold_tokens > 0 and estimated_active_tokens < self.threshold_tokens:
+                if (
+                    (not deferred_maintenance_active)
+                    and self.threshold_tokens > 0
+                    and estimated_compaction_tokens < self.threshold_tokens
+                ):
                     break
                 leading_anchor_count = self._leading_anchor_count(working_messages)
                 remaining_fresh_tail_start = self._fresh_tail_start(pressure_messages)
@@ -925,11 +1094,19 @@ class CompactionMixin:
                     0,
                     _THRESHOLD_FULL_SWEEP_MAX_PASSES - leaf_passes,
                 )
-                condensation_passes, sweep_stop_reason = (
+                (
+                    condensation_passes,
+                    sweep_stop_reason,
+                    estimated_provider_request_tokens,
+                ) = (
                     self._run_threshold_sweep_condensation(
                         target_tokens=sweep_target_tokens,
+                        provider_request_tokens=estimated_provider_request_tokens,
+                        post_compaction_target_tokens=post_compaction_target_tokens,
+                        can_report_post_compaction_target=fixed_request_overhead_known,
                         pass_budget=remaining_passes,
                         deadline=sweep_deadline,
+                        measure_provider_request_tokens=measure_provider_request_tokens,
                         focus_topic=focus_topic,
                     )
                 )
@@ -946,17 +1123,8 @@ class CompactionMixin:
             working_messages,
             observed_tokens=observed_prompt_tokens,
         )
-        leading_anchor_count = self._leading_anchor_count(working_messages)
-        anchor_leading_count = self._leading_anchor_count(anchor_source_messages)
-        self._pending_context_anchor_messages = anchor_source_messages[anchor_leading_count:]
-        try:
-            compressed = self._assemble_context(
-                working_messages[0] if leading_anchor_count else None,
-                working_messages[leading_anchor_count:],
-                assembly_cap_override=recovery_assembly_cap,
-            )
-        finally:
-            self._pending_context_anchor_messages = None
+        if compressed is None:
+            compressed = assemble_working_context()
         self.compression_count += 1
         self._last_compaction_duration_ms = (time.perf_counter() - _compress_started) * 1000.0
         logger.info(
@@ -1000,6 +1168,15 @@ class CompactionMixin:
             total_passes = leaf_passes + condensation_passes
             duration_ms = (time.perf_counter() - _compress_started) * 1000.0
             final_stop_reason = sweep_stop_reason or "raw_prefix_drained"
+            assembled_message_tokens_after = count_messages_tokens(compressed)
+            provider_request_tokens_after = (
+                assembled_message_tokens_after + fixed_request_overhead_tokens
+            )
+            if (
+                final_stop_reason == "post_compaction_target_reached"
+                and provider_request_tokens_after > post_compaction_target_tokens
+            ):
+                final_stop_reason = "post_compaction_target_unreached_after_final_assembly"
             partial_stop_reasons = {
                 "pass_budget_exhausted",
                 "time_budget_exhausted",
@@ -1007,6 +1184,8 @@ class CompactionMixin:
                 "condensation_error",
                 "condensation_no_progress",
                 "no_same_depth_condensation_group",
+                "post_compaction_target_unreached_no_same_depth_condensation_group",
+                "post_compaction_target_unreached_after_final_assembly",
             }
             self._last_threshold_full_sweep = {
                 "status": "partial" if final_stop_reason in partial_stop_reasons else "completed",
@@ -1014,11 +1193,20 @@ class CompactionMixin:
                 "condensation_passes": condensation_passes,
                 "total_passes": total_passes,
                 "duration_ms": round(duration_ms, 3),
+                "token_semantics": "estimated_whole_provider_request",
                 "tokens_before": self._last_threshold_full_sweep["tokens_before"],
-                "tokens_after": count_messages_tokens(compressed),
+                "tokens_after": provider_request_tokens_after,
+                "assembled_message_tokens_before": original_message_tokens,
+                "assembled_message_tokens_after": assembled_message_tokens_after,
+                "fixed_request_overhead_tokens": fixed_request_overhead_tokens,
+                "fixed_request_overhead_known": fixed_request_overhead_known,
+                "fixed_request_overhead_source": fixed_request_overhead_source,
+                "proactive_recall_budget_tokens": proactive_recall_budget_tokens,
                 "summary_prefix_tokens_before": sweep_summary_prefix_before,
                 "summary_prefix_tokens_after": self._summary_frontier_tokens(),
                 "summary_prefix_target_tokens": sweep_target_tokens,
+                "post_compaction_target_ratio": self._config.post_compaction_target_ratio,
+                "post_compaction_target_tokens": post_compaction_target_tokens,
                 "stop_reason": final_stop_reason,
                 "budget_exhausted": final_stop_reason
                 in {"pass_budget_exhausted", "time_budget_exhausted"},

@@ -334,6 +334,8 @@ Most installs only need `plugins.enabled` and `context.engine: lcm`.
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
 | `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
+| `LCM_THRESHOLD_ONLY_COMPACTION_ENABLED` | `false` | Defer automatic summary-producing maintenance until threshold, then use the bounded full sweep; raw ingest and deterministic cleanup continue below threshold |
+| `LCM_POST_COMPACTION_TARGET_RATIO` | `0.0` | Optional best-effort whole provider-request target for a threshold full sweep; must be lower than the effective trigger ratio (`0.0` preserves the legacy sweep target) |
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_DATABASE_PATH` | auto | SQLite database path. Empty config resolves to `HERMES_HOME/lcm.db`; plugin installs or operators may set this env var to another profile-scoped path such as `~/.hermes/hermes-lcm.db`. |
@@ -458,12 +460,26 @@ understanding whether your workload is dominated by huge raw backlog passes.
 `LCM_THRESHOLD_FULL_SWEEP_ENABLED=true` is an opt-in cache-shape policy. Once
 threshold pressure triggers compaction, the invocation keeps summarizing the
 oldest raw chunks outside the protected fresh tail even after pressure falls
-below the trigger. It then condenses the provider-visible summary frontier only
-when that frontier exceeds `LCM_SUMMARY_PREFIX_TARGET_TOKENS` (or one leaf
-budget when the target is `0`). One invocation is bounded to 12 total leaf plus
-condensation calls and 120 seconds between calls, persists each completed DAG
-pass, and publishes one newly assembled active context at the end. It is
-synchronous and independent of deferred/background maintenance.
+below the trigger. `LCM_THRESHOLD_ONLY_COMPACTION_ENABLED=true` additionally
+defers automatic leaf and deferred-maintenance summaries below threshold, while
+raw ingest, sensitive cleanup, externalization/stubbing, overflow recovery, and
+manual force remain active; at threshold it enables the same full sweep.
+
+By default the sweep drains the eligible raw prefix, then condenses the visible
+summary frontier toward `LCM_SUMMARY_PREFIX_TARGET_TOKENS` (or one leaf budget
+when that target is `0`). A valid `LCM_POST_COMPACTION_TARGET_RATIO` between
+`0.0` and the effective trigger ratio adds an earlier normal stop when the
+estimated whole provider request reaches that fraction of the context window.
+The estimate includes assembled-message tokens, fixed Hermes request overhead
+derived from `current_tokens`, and a conservative proactive-recall reserve. If
+`current_tokens` is unavailable, LCM uses unobserved context headroom as fallback
+overhead and will not claim the target was exactly reached. Sweep telemetry uses
+`tokens_before`/`tokens_after` for whole-request estimates and reports assembled
+message tokens separately. Invalid ratios are ignored and reported by
+`lcm_doctor`. One invocation remains
+bounded to 12 total leaf plus condensation calls and 120 seconds between calls,
+persists each completed DAG pass, and publishes one newly assembled active
+context at the end.
 
 ### Cache policy boundary
 

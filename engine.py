@@ -297,11 +297,20 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "condensation_passes": 0,
             "total_passes": 0,
             "duration_ms": 0.0,
+            "token_semantics": "estimated_whole_provider_request",
             "tokens_before": 0,
             "tokens_after": 0,
+            "assembled_message_tokens_before": 0,
+            "assembled_message_tokens_after": 0,
+            "fixed_request_overhead_tokens": 0,
+            "fixed_request_overhead_known": False,
+            "fixed_request_overhead_source": "unavailable",
+            "proactive_recall_budget_tokens": 0,
             "summary_prefix_tokens_before": 0,
             "summary_prefix_tokens_after": 0,
             "summary_prefix_target_tokens": 0,
+            "post_compaction_target_ratio": 0.0,
+            "post_compaction_target_tokens": 0,
             "stop_reason": "",
             "budget_exhausted": False,
         }
@@ -4569,6 +4578,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         messages: List[Dict[str, Any]],
         *,
         insert_missing_tool_stubs: bool = True,
+        externalize_preserved_payloads: bool = True,
     ) -> List[Dict[str, Any]]:
         """Drop unsafe assistant-only noise, then repair tool sequencing.
 
@@ -4580,7 +4590,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         dropped_assistant_messages = 0
         stripped_assistant_messages = 0
         for msg in messages:
-            msg = self._sanitize_active_preserved_objective_message(msg)
+            msg = self._sanitize_active_preserved_objective_message(
+                msg,
+                externalize_payloads=externalize_preserved_payloads,
+            )
             if msg.get("role") == "assistant":
                 cleaned_msg = _clean_active_assistant_message(msg)
                 if cleaned_msg is None:
@@ -5057,20 +5070,44 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         *,
         target_tokens: int,
+        provider_request_tokens: int,
+        post_compaction_target_tokens: int,
+        can_report_post_compaction_target: bool,
         pass_budget: int,
         deadline: float,
+        measure_provider_request_tokens,
         focus_topic: Optional[str] = None,
-    ) -> tuple[int, str]:
+    ) -> tuple[int, str, int]:
         """Condense an oversized summary frontier within the remaining sweep budget."""
         passes = 0
-        while self._summary_frontier_tokens() > target_tokens:
+        while (
+            self._summary_frontier_tokens() > target_tokens
+            or (
+                post_compaction_target_tokens > 0
+                and (
+                    not can_report_post_compaction_target
+                    or provider_request_tokens > post_compaction_target_tokens
+                )
+            )
+        ):
+            if (
+                post_compaction_target_tokens > 0
+                and can_report_post_compaction_target
+                and provider_request_tokens <= post_compaction_target_tokens
+            ):
+                return passes, "post_compaction_target_reached", provider_request_tokens
             if passes >= pass_budget:
-                return passes, "pass_budget_exhausted"
+                return passes, "pass_budget_exhausted", provider_request_tokens
             if time.monotonic() >= deadline:
-                return passes, "time_budget_exhausted"
+                return passes, "time_budget_exhausted", provider_request_tokens
             group = self._select_threshold_sweep_condensation_group()
             if not group:
-                return passes, "no_same_depth_condensation_group"
+                reason = (
+                    "post_compaction_target_unreached_no_same_depth_condensation_group"
+                    if post_compaction_target_tokens > 0
+                    else "no_same_depth_condensation_group"
+                )
+                return passes, reason, provider_request_tokens
             before = self._summary_frontier_tokens()
             try:
                 self._condense_summary_nodes(
@@ -5084,12 +5121,34 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     passes,
                     exc,
                 )
-                return passes, "condensation_error"
+                return passes, "condensation_error", provider_request_tokens
             passes += 1
             after = self._summary_frontier_tokens()
             if after >= before:
-                return passes, "condensation_no_progress"
-        return passes, "summary_prefix_target_reached"
+                return passes, "condensation_no_progress", provider_request_tokens
+            if post_compaction_target_tokens > 0:
+                provider_request_tokens = measure_provider_request_tokens()
+                if (
+                    can_report_post_compaction_target
+                    and provider_request_tokens <= post_compaction_target_tokens
+                ):
+                    return (
+                        passes,
+                        "post_compaction_target_reached",
+                        provider_request_tokens,
+                    )
+            else:
+                provider_request_tokens = max(
+                    0,
+                    provider_request_tokens - before + after,
+                )
+        if (
+            post_compaction_target_tokens > 0
+            and can_report_post_compaction_target
+            and provider_request_tokens <= post_compaction_target_tokens
+        ):
+            return passes, "post_compaction_target_reached", provider_request_tokens
+        return passes, "summary_prefix_target_reached", provider_request_tokens
 
     # -- Internal: context assembly ----------------------------------------
 
@@ -5121,40 +5180,67 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         content = text_content_for_pattern_matching(message.get("content")) or ""
         return content if content.lstrip().startswith(_PRESERVED_OBJECTIVE_CONTEXT_PREFIX) else ""
 
-    def _sanitized_preserved_objective_context_content(self, message: Dict[str, Any]) -> str:
+    def _sanitized_preserved_objective_context_content(
+        self,
+        message: Dict[str, Any],
+        *,
+        externalize_payloads: bool = True,
+    ) -> str:
         preserved_objective = self._preserved_objective_context_content(message)
         if not preserved_objective:
             return ""
         return self._sanitize_preserved_objective_content(
             preserved_objective,
             role=str(message.get("role") or "user"),
+            externalize_payloads=externalize_payloads,
         )
 
-    def _sanitize_active_preserved_objective_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        sanitized_content = self._sanitized_preserved_objective_context_content(message)
+    def _sanitize_active_preserved_objective_message(
+        self,
+        message: Dict[str, Any],
+        *,
+        externalize_payloads: bool = True,
+    ) -> Dict[str, Any]:
+        sanitized_content = self._sanitized_preserved_objective_context_content(
+            message,
+            externalize_payloads=externalize_payloads,
+        )
         if not sanitized_content or sanitized_content == message.get("content"):
             return message
         sanitized = dict(message)
         sanitized["content"] = sanitized_content
         return sanitized
 
-    def _sanitize_preserved_objective_content(self, content: str, role: str = "user") -> str:
+    def _sanitize_preserved_objective_content(
+        self,
+        content: str,
+        role: str = "user",
+        *,
+        externalize_payloads: bool = True,
+    ) -> str:
         content = strip_injected_context_blocks(content)
-        content = protect_inline_payloads_in_text(
-            content,
-            role=role,
-            session_id=self._session_id,
-            field_path="preserved_objective.content",
-            config=self._config,
-            hermes_home=self._hermes_home,
-        )
+        if externalize_payloads:
+            content = protect_inline_payloads_in_text(
+                content,
+                role=role,
+                session_id=self._session_id,
+                field_path="preserved_objective.content",
+                config=self._config,
+                hermes_home=self._hermes_home,
+            )
         return content
 
-    def _build_preserved_objective_summary_part(self, message: Dict[str, Any]) -> str:
+    def _build_preserved_objective_summary_part(
+        self,
+        message: Dict[str, Any],
+        *,
+        externalize_payloads: bool = True,
+    ) -> str:
         content = text_content_for_pattern_matching(message.get("content")) or ""
         content = self._sanitize_preserved_objective_content(
             content,
             role=str(message.get("role") or "user"),
+            externalize_payloads=externalize_payloads,
         )
         return f"{_PRESERVED_OBJECTIVE_CONTEXT_PREFIX}\n{content}"
 
@@ -5162,6 +5248,8 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self,
         messages: List[Dict[str, Any]],
         selected_tail: List[Dict[str, Any]],
+        *,
+        externalize_payloads: bool = True,
     ) -> Optional[str]:
         """Return a scaffolded newest real user objective omitted from the tail.
 
@@ -5199,7 +5287,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                 continue
             if any(message == selected for selected in selected_tail_messages):
                 return None
-            return self._build_preserved_objective_summary_part(message)
+            return self._build_preserved_objective_summary_part(
+                message,
+                externalize_payloads=externalize_payloads,
+            )
         return None
 
     @staticmethod
@@ -5345,6 +5436,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         tail_messages: List[Dict[str, Any]],
         assembly_cap_override: Optional[int] = None,
         include_lcm_note: bool = True,
+        for_measurement: bool = False,
     ) -> List[Dict[str, Any]]:
         """Build the active context from DAG summaries + fresh tail.
 
@@ -5352,6 +5444,9 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
           [leading anchor, normally system prompt]
           [highest-depth summary nodes first, then lower]
           [fresh tail messages]
+
+        Measurement mode is pure: it leaves tool payloads inline and omits
+        proactive recall; the caller reserves the full recall token budget.
         """
         result = []
 
@@ -5379,7 +5474,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # Stub durably externalized evictable tool payloads before the assembly
         # budget pass so the selector sees their reduced provider-visible cost.
         # The helper protects the configured fresh tail and is fail-open.
-        assembly_tail_messages = self._stub_large_tool_results_for_active_replay(tail_messages)
+        assembly_tail_messages = (
+            tail_messages
+            if for_measurement
+            else self._stub_large_tool_results_for_active_replay(tail_messages)
+        )
         tail_selected = assembly_tail_messages
         anchor_source = getattr(self, "_pending_context_anchor_messages", None)
         if anchor_source is None:
@@ -5393,6 +5492,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             tail_for_selection = self._sanitize_active_context_messages(
                 assembly_tail_messages,
                 insert_missing_tool_stubs=False,
+                externalize_preserved_payloads=not for_measurement,
             )
             skipped_tail_gap = False
             for msg in reversed(tail_for_selection):
@@ -5409,7 +5509,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             tail_selected = list(reversed(kept_tail_reversed))
             summary_budget = max(0, assembly_cap - used - tail_token_total)
         if anchor_source is not None:
-            anchor_part = self._latest_user_context_anchor(anchor_source, tail_selected)
+            anchor_part = self._latest_user_context_anchor(
+                anchor_source,
+                tail_selected,
+                externalize_payloads=not for_measurement,
+            )
 
         # Collect DAG summaries — highest depth first for context hierarchy
         summary_parts: list[str] = []
@@ -5474,11 +5578,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # cache-stable summaries and above the volatile fresh tail — so the
         # already-volatile tail region absorbs its per-turn variability and the
         # cached summary prefix is left intact. Never inside the fresh tail.
-        proactive_msg = self._build_proactive_recall_message(
-            tail_messages, summary_role, active_summary_node_ids
-        )
-        if proactive_msg is not None:
-            result.append(proactive_msg)
+        if not for_measurement:
+            proactive_msg = self._build_proactive_recall_message(
+                tail_messages, summary_role, active_summary_node_ids
+            )
+            if proactive_msg is not None:
+                result.append(proactive_msg)
 
         # Fresh tail
         result.extend(tail_selected)
@@ -5486,7 +5591,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         # ── Active-context cleanup / tool-pair guardrail ──
         # Drop assistant turns that carry only blank/internal structured content,
         # then ensure provider-valid tool-call/result sequencing.
-        result = self._sanitize_active_context_messages(result)
+        result = self._sanitize_active_context_messages(
+            result,
+            externalize_preserved_payloads=not for_measurement,
+        )
         if leading_msg is None:
             while result and result[0].get("role") in {"assistant", "tool"}:
                 result = result[1:]
@@ -5509,7 +5617,10 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                     trimmed = msg.copy()
                     trimmed["content"] = "\n\n---\n\n".join(parts)
                     trimmed_result.append(trimmed)
-            result = self._sanitize_active_context_messages(trimmed_result)
+            result = self._sanitize_active_context_messages(
+                trimmed_result,
+                externalize_preserved_payloads=not for_measurement,
+            )
 
         return result
 

@@ -145,6 +145,8 @@ environment variables:
 | `LCM_DYNAMIC_LEAF_CHUNK_ENABLED` | `false` | Enable chunk-sized leaf compaction passes instead of compacting the whole non-tail raw backlog per pass |
 | `LCM_DYNAMIC_LEAF_CHUNK_MAX` | `40000` | Upper bound for dynamic leaf chunk targets |
 | `LCM_THRESHOLD_FULL_SWEEP_ENABLED` | `false` | At threshold, opt into one synchronous bounded sweep that drains chunked raw history before publishing one new active context |
+| `LCM_THRESHOLD_ONLY_COMPACTION_ENABLED` | `false` | Defer automatic summary-producing maintenance until threshold, then use the bounded full sweep; raw ingest and deterministic cleanup continue below threshold |
+| `LCM_POST_COMPACTION_TARGET_RATIO` | `0.0` | Optional best-effort whole provider-request target for a threshold full sweep; must be lower than the effective trigger ratio (`0.0` preserves legacy behavior) |
 | `LCM_SUMMARY_PREFIX_TARGET_TOKENS` | `0` | Sweep-only summary-frontier target; `0` derives one `LCM_LEAF_CHUNK_TOKENS` budget |
 | `LCM_NEW_SESSION_RETAIN_DEPTH` | `2` | DAG depth retained after manual `/new` (`-1` all, `0` none) |
 | `LCM_IGNORE_SESSION_PATTERNS` | empty | Comma-separated session globs excluded from LCM storage |
@@ -412,6 +414,21 @@ What the main knobs do:
   invocation is bounded to 12 summary calls and 120 seconds between calls,
   persists each completed DAG pass, and publishes one active context at the end.
   It remains synchronous and does not enable deferred/background maintenance.
+- `LCM_THRESHOLD_ONLY_COMPACTION_ENABLED=true` keeps ordinary leaf and deferred
+  maintenance summaries behind the context threshold and enables that same full
+  sweep at threshold. Below threshold it still ingests raw messages and applies
+  deterministic sensitive cleanup, externalization/stubbing, and tool-pair
+  sanitation; manual force and provider-limit overflow recovery remain exempt.
+- `LCM_POST_COMPACTION_TARGET_RATIO` adds a best-effort full-sweep stop based on
+  the estimated whole provider request: assembled messages plus fixed Hermes
+  system/tool/schema overhead and a proactive-recall reserve. `tokens_before`
+  and `tokens_after` in sweep telemetry use that whole-request estimate;
+  `assembled_message_tokens_*` reports the message-list portion. When Hermes
+  does not provide a positive `current_tokens`, LCM conservatively treats
+  unobserved context headroom as overhead and never reports an exact target hit.
+  Use `0.0` to retain the legacy raw-drain plus summary-prefix target. A non-zero
+  value must be finite, below `1.0`, and lower than the effective runtime trigger
+  (`threshold_tokens`); `lcm_doctor` warns and disables invalid targets.
 - `LCM_EXPANSION_CONTEXT_TOKENS` controls how much recovered material
   `lcm_expand_query` may feed to the auxiliary model. It does not change what
   LCM stores.

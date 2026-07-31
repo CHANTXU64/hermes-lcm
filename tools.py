@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -4661,6 +4662,8 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
             "deferred_maintenance_max_passes": engine._config.deferred_maintenance_max_passes,
             "critical_budget_pressure_ratio": engine._config.critical_budget_pressure_ratio,
             "threshold_full_sweep_enabled": engine._config.threshold_full_sweep_enabled,
+            "threshold_only_compaction_enabled": engine._config.threshold_only_compaction_enabled,
+            "post_compaction_target_ratio": engine._config.post_compaction_target_ratio,
             "summary_prefix_target_tokens": engine._config.summary_prefix_target_tokens,
             "threshold_full_sweep_max_passes": 12,
             "threshold_full_sweep_max_seconds": 120,
@@ -4986,6 +4989,28 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         config_warnings.append("condensation_fanin < 2 creates excessive depth growth")
     if c.incremental_max_depth == 0:
         config_warnings.append("incremental_max_depth=0 disables condensation entirely")
+    post_target_ratio = float(c.post_compaction_target_ratio)
+    runtime_context_length = int(getattr(engine, "context_length", 0) or 0)
+    runtime_threshold_tokens = int(getattr(engine, "threshold_tokens", 0) or 0)
+    if not math.isfinite(post_target_ratio) or post_target_ratio < 0 or post_target_ratio >= 1:
+        config_warnings.append(
+            "post_compaction_target_ratio must be 0.0 (disabled) or a finite ratio below 1.0"
+        )
+    elif post_target_ratio > 0 and (
+        (
+            runtime_context_length > 0
+            and runtime_threshold_tokens > 0
+            and max(1, int(runtime_context_length * post_target_ratio))
+            >= runtime_threshold_tokens
+        )
+        or (
+            (runtime_context_length <= 0 or runtime_threshold_tokens <= 0)
+            and post_target_ratio >= runtime_context_threshold
+        )
+    ):
+        config_warnings.append(
+            "post_compaction_target_ratio must be lower than the effective runtime trigger"
+        )
     for warning in getattr(c, "config_source_warnings", []) or []:
         config_warnings.append(warning)
     for key in getattr(c, "ignored_config_yaml_lcm_keys", []) or []:

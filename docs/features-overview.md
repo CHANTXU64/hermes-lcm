@@ -59,7 +59,8 @@ prompt, and its bytes get duplicated into every SQLite backup and WAL file.
 | Historical backfill (dry-run first) | Old sessions' already-stored giant outputs can be externalized after the fact | Existing bloated databases get the same relief as new traffic |
 | Externalized payload search | `lcm_grep(content_scope='externalized'\|'both')` searches payload prefixes, bounded (≤256 files, ≤512KB scanned per file) | "Which run printed that error?" works even after the output left the prompt |
 | Fresh-tail token cap | `LCM_FRESH_TAIL_MAX_TOKENS` caps the protected tail by tokens, not just message count | One giant recent tool result can no longer pin the whole budget; complete assistant/tool groups are always kept intact |
-| Threshold full sweep | At threshold, one synchronous bounded sweep drains chunked raw backlog before publishing a single new prefix | Long-idle sessions catch up in one pass instead of thrashing repeated compactions |
+| Threshold full sweep | At threshold, one synchronous bounded sweep drains chunked raw backlog before publishing a single new prefix; an optional best-effort whole-provider-request target can stop earlier | Long-idle sessions catch up without repeated prefix churn, with a configurable post-compaction budget |
+| Threshold-only compaction | Raw ingest and deterministic cleanup continue below threshold, but automatic leaf/deferred summaries wait for the bounded full sweep | Provider-visible prefixes stay stable between deliberate high-water compactions |
 
 Failure posture: externalization is fail-open (if a write fails, the provider
 still receives the original inline payload — nothing is dropped), and every
@@ -67,7 +68,8 @@ replaced payload keeps a lossless recovery path via its ref.
 
 Key switches: `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED`,
 `LCM_LARGE_OUTPUT_ACTIVE_REPLAY_STUBBING_ENABLED` (+ threshold vars),
-`LCM_FRESH_TAIL_MAX_TOKENS`, `LCM_THRESHOLD_FULL_SWEEP_ENABLED`.
+`LCM_FRESH_TAIL_MAX_TOKENS`, `LCM_THRESHOLD_FULL_SWEEP_ENABLED`,
+`LCM_THRESHOLD_ONLY_COMPACTION_ENABLED`, `LCM_POST_COMPACTION_TARGET_RATIO`.
 Full table: [Operator guide → Configuration](operator-guide.md#configuration).
 
 ## Family 2 — Temporal memory (rollups + `lcm_recent`)

@@ -278,6 +278,33 @@ def test_lcm_status_does_not_report_invalid_env_as_effective_source(tmp_path, mo
     assert any("LCM_LEAF_CHUNK_TOKENS" in warning for warning in payload["config_source_warnings"])
 
 
+def test_malformed_post_target_env_is_disabled_and_reported_by_doctor(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes_home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("LCM_POST_COMPACTION_TARGET_RATIO", "not-a-ratio")
+
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm_invalid_post_target_source.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    engine.on_session_start("invalid-post-target-source", platform="telegram", context_length=100_000)
+    try:
+        doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+        validation = next(check for check in doctor["checks"] if check["check"] == "config_validation")
+
+        assert config.post_compaction_target_ratio == 0.0
+        assert config.config_sources["post_compaction_target_ratio"] == "default"
+        warning = next(
+            warning
+            for warning in config.config_source_warnings
+            if "LCM_POST_COMPACTION_TARGET_RATIO" in warning
+        )
+        assert validation["status"] == "warn"
+        assert warning in validation["detail"]
+    finally:
+        engine.shutdown()
+
+
 def test_lcm_status_text_reports_config_source_for_context_threshold(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes_home"
     hermes_home.mkdir()
@@ -331,6 +358,21 @@ def test_lcm_status_reports_last_compression_noop_reason(engine):
         "last_compression_noop_reason: no eligible raw backlog outside fresh tail"
         in result
     )
+
+
+def test_lcm_status_reports_threshold_only_and_post_compaction_target(engine):
+    engine._config.threshold_full_sweep_enabled = True
+    engine._config.threshold_only_compaction_enabled = True
+    engine._config.post_compaction_target_ratio = 0.25
+
+    text_status = handle_lcm_command("status", engine)
+    json_status = json.loads(lcm_tools.lcm_status({}, engine=engine))
+
+    assert "threshold_full_sweep_enabled: yes" in text_status
+    assert "threshold_only_compaction_enabled: yes" in text_status
+    assert "post_compaction_target_ratio: 0.25" in text_status
+    assert json_status["config"]["threshold_only_compaction_enabled"] is True
+    assert json_status["config"]["post_compaction_target_ratio"] == 0.25
 
 
 def test_lcm_status_reports_cache_usage_metrics_when_host_provides_them(engine):
@@ -537,6 +579,55 @@ def test_lcm_doctor_config_validation_uses_runtime_threshold_for_autoraised_cont
         assert engine.context_threshold == 0.85
         assert validation["status"] == "pass"
         assert validation["detail"] == "all settings within normal ranges"
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize("target_ratio", [-0.1, 0.8, 1.1])
+def test_lcm_doctor_rejects_invalid_post_compaction_target_ratio(tmp_path, target_ratio):
+    config = LCMConfig(
+        context_threshold=0.8,
+        post_compaction_target_ratio=target_ratio,
+        database_path=str(tmp_path / f"doctor-invalid-post-target-{target_ratio}.db"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.on_session_start("invalid-post-target", platform="cli", context_length=100_000)
+
+        doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+        validation = next(check for check in doctor["checks"] if check["check"] == "config_validation")
+
+        assert validation["status"] == "warn"
+        assert any(
+            "post_compaction_target_ratio" in warning
+            for warning in validation["detail"]
+        )
+        assert engine._post_compaction_target_tokens() == 0
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_doctor_rejects_post_target_at_effective_assembly_trigger(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.8,
+        max_assembly_tokens=400,
+        post_compaction_target_ratio=0.5,
+        database_path=str(tmp_path / "doctor-post-target-above-effective-trigger.db"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.on_session_start("invalid-post-target", platform="cli", context_length=1000)
+
+        doctor = json.loads(lcm_tools.lcm_doctor({}, engine=engine))
+        validation = next(check for check in doctor["checks"] if check["check"] == "config_validation")
+
+        assert engine.threshold_tokens == 400
+        assert any(
+            "post_compaction_target_ratio" in warning
+            and "effective runtime trigger" in warning
+            for warning in validation["detail"]
+        )
+        assert engine._post_compaction_target_tokens() == 0
     finally:
         engine.shutdown()
 

@@ -69,6 +69,12 @@ export LCM_FRESH_TAIL_MAX_TOKENS=24000
 # Optional: at threshold, drain the whole raw backlog in one bounded sweep
 # (fewer, larger compactions — useful after long unattended runs)
 export LCM_THRESHOLD_FULL_SWEEP_ENABLED=true
+
+# Optional high-water policy: keep ordinary summaries behind the threshold,
+# then use the same bounded sweep. Deterministic cleanup still runs immediately.
+# export LCM_THRESHOLD_ONLY_COMPACTION_ENABLED=true
+# Best-effort stop once the estimated whole provider request reaches 55%.
+# export LCM_POST_COMPACTION_TARGET_RATIO=0.55
 ```
 
 Recovery stays first-class: `lcm_describe`/`lcm_expand` read externalized

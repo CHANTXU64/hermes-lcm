@@ -321,7 +321,11 @@ def test_orphan_tool_result_is_not_externalized_as_a_phantom_reference(make_engi
 
 
 def test_live_interceptor_adopts_current_tool_stub_below_compaction_threshold(make_engine):
-    engine = make_engine(fresh_tail_count=32, leaf_chunk_tokens=20_000)
+    engine = make_engine(
+        fresh_tail_count=32,
+        leaf_chunk_tokens=20_000,
+        threshold_only_compaction_enabled=True,
+    )
     engine.threshold_tokens = 100_000
     payload = "live current payload " * 100
     messages = [

@@ -562,6 +562,8 @@ class TestConfig:
         assert c.deferred_maintenance_max_passes == 4
         assert c.critical_budget_pressure_ratio == 0.0
         assert c.threshold_full_sweep_enabled is False
+        assert c.threshold_only_compaction_enabled is False
+        assert c.post_compaction_target_ratio == 0.0
         assert c.summary_prefix_target_tokens == 0
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
@@ -601,6 +603,8 @@ class TestConfig:
         monkeypatch.setenv("LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS", "3")
         monkeypatch.setenv("LCM_CRITICAL_BUDGET_PRESSURE_RATIO", "0.92")
         monkeypatch.setenv("LCM_THRESHOLD_FULL_SWEEP_ENABLED", "true")
+        monkeypatch.setenv("LCM_THRESHOLD_ONLY_COMPACTION_ENABLED", "true")
+        monkeypatch.setenv("LCM_POST_COMPACTION_TARGET_RATIO", "0.70")
         monkeypatch.setenv("LCM_SUMMARY_PREFIX_TARGET_TOKENS", "18000")
         monkeypatch.setenv("LCM_CUSTOM_INSTRUCTIONS", "Write as a neutral documenter.")
         monkeypatch.setenv("LCM_EXTRACTION_ENABLED", "true")
@@ -640,6 +644,8 @@ class TestConfig:
         assert c.cache_friendly_min_debt_groups == 3
         assert c.critical_budget_pressure_ratio == 0.92
         assert c.threshold_full_sweep_enabled is True
+        assert c.threshold_only_compaction_enabled is True
+        assert c.post_compaction_target_ratio == 0.70
         assert c.summary_prefix_target_tokens == 18_000
         assert c.custom_instructions == "Write as a neutral documenter."
         assert c.extraction_enabled is True
