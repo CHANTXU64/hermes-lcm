@@ -16,6 +16,7 @@ Upstream can perform incremental Leaf maintenance below the global context thres
 4. Fixed system/tool/schema overhead supplied by Hermes remains part of every target decision.
 5. Provisional accounting is side-effect-free; proactive recall and large-output externalization are reserved or measured without repeatedly executing their side effects during each pass.
 6. An unreachable target is reported as partial with an explicit reason instead of being labelled completed.
+7. LCM supports `lcm.model_policies` so different models can independently override both the trigger and whole-request target ratios.
 
 Both new capabilities are disabled by default, preserving upstream behavior unless explicitly enabled.
 
@@ -38,6 +39,17 @@ Enable threshold-only scheduling:
 LCM_THRESHOLD_ONLY_COMPACTION_ENABLED=true
 ```
 
+Optionally set a model-specific trigger and target in Hermes config. Matching
+uses longest-substring selection and is recalculated on each model switch:
+
+```yaml
+lcm:
+  model_policies:
+    deepseek-v4-flash:
+      context_threshold: 0.40
+      post_compaction_target_ratio: 0.10
+```
+
 Optionally set a best-effort whole-request target as a fraction of the effective runtime context length:
 
 ```bash
@@ -45,6 +57,18 @@ LCM_POST_COMPACTION_TARGET_RATIO=0.35
 ```
 
 The post-compaction ratio must be greater than zero and lower than the effective trigger ratio. Invalid or malformed supplied values remain disabled and are exposed through configuration-source warnings and `lcm_doctor`.
+
+The two ratios are independent. The model policy above starts the sweep at
+400K and sets a 100K estimated whole-provider-request target on a 1M window.
+An omitted target falls back to its global LCM value. An omitted trigger first
+checks Hermes `compression.model_thresholds`, then falls back globally.
+Reaching 100K remains best effort: fixed Hermes request overhead, protected
+fresh-tail content, summary size, the 12-pass bound, or the 120-second bound can
+produce a truthful `partial` result instead.
+
+For compatibility, Hermes `compression.model_thresholds` remains a
+trigger-only fallback when a matched LCM policy does not define
+`context_threshold`; it cannot set the post-compaction target.
 
 Relevant safety behavior:
 

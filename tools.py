@@ -4629,6 +4629,21 @@ def lcm_status(args: Dict[str, Any], **kwargs) -> str:
         "context_threshold": full_status.get("context_threshold", engine._config.context_threshold),
         "context_threshold_source": full_status.get("context_threshold_source", ""),
         "context_threshold_autoraised": full_status.get("context_threshold_autoraised"),
+        "configured_post_compaction_target_ratio": full_status.get(
+            "configured_post_compaction_target_ratio",
+            engine._config.post_compaction_target_ratio,
+        ),
+        "post_compaction_target_ratio": full_status.get(
+            "post_compaction_target_ratio",
+            engine._config.post_compaction_target_ratio,
+        ),
+        "post_compaction_target_ratio_source": full_status.get(
+            "post_compaction_target_ratio_source", ""
+        ),
+        "post_compaction_target_tokens": full_status.get(
+            "post_compaction_target_tokens", 0
+        ),
+        "matched_model_policy_key": full_status.get("matched_model_policy_key", ""),
         "threshold_tokens": engine.threshold_tokens,
         "last_prompt_tokens": engine.last_prompt_tokens,
         "last_input_tokens": engine.last_input_tokens,
@@ -4989,7 +5004,9 @@ def lcm_doctor(args: Dict[str, Any], **kwargs) -> str:
         config_warnings.append("condensation_fanin < 2 creates excessive depth growth")
     if c.incremental_max_depth == 0:
         config_warnings.append("incremental_max_depth=0 disables condensation entirely")
-    post_target_ratio = float(c.post_compaction_target_ratio)
+    post_target_ratio = float(
+        getattr(engine, "post_compaction_target_ratio", c.post_compaction_target_ratio)
+    )
     runtime_context_length = int(getattr(engine, "context_length", 0) or 0)
     runtime_threshold_tokens = int(getattr(engine, "threshold_tokens", 0) or 0)
     if not math.isfinite(post_target_ratio) or post_target_ratio < 0 or post_target_ratio >= 1:

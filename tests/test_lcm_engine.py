@@ -351,6 +351,295 @@ def test_update_model_updates_runtime_metadata_and_context_window(engine):
     assert engine.threshold_tokens == int(1_000_000 * engine._config.context_threshold)
 
 
+def test_update_model_applies_lcm_policy_trigger_and_target_then_restores_globals(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        post_compaction_target_ratio=0.3,
+        model_policies={
+            "deepseek-v4": {
+                "context_threshold": 0.5,
+                "post_compaction_target_ratio": 0.2,
+            },
+            "deepseek-v4-flash": {
+                "context_threshold": 0.4,
+                "post_compaction_target_ratio": 0.1,
+            },
+        },
+        database_path=str(tmp_path / "lcm-model-policy-switch.db"),
+    )
+    config.config_sources.update(
+        {
+            "context_threshold": "env:LCM_CONTEXT_THRESHOLD",
+            "post_compaction_target_ratio": "env:LCM_POST_COMPACTION_TARGET_RATIO",
+        }
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model(
+            model="deepseek-v4-flash-20260801",
+            provider="opencode-go",
+            context_length=1_000_000,
+        )
+
+        status = engine.get_status()
+        assert engine.threshold_tokens == 400_000
+        assert status["context_threshold"] == 0.4
+        assert status["post_compaction_target_ratio"] == 0.1
+        assert status["post_compaction_target_tokens"] == 100_000
+        assert status["matched_model_policy_key"] == "deepseek-v4-flash"
+        assert status["context_threshold_source"].endswith(
+            ":deepseek-v4-flash.context_threshold"
+        )
+        assert status["post_compaction_target_ratio_source"].endswith(
+            ":deepseek-v4-flash.post_compaction_target_ratio"
+        )
+
+        engine.update_model(
+            model="some-other-model",
+            provider="other",
+            context_length=1_000_000,
+        )
+
+        status = engine.get_status()
+        assert engine.threshold_tokens == 850_000
+        assert status["context_threshold"] == 0.85
+        assert status["post_compaction_target_ratio"] == 0.3
+        assert status["post_compaction_target_tokens"] == 300_000
+        assert status["matched_model_policy_key"] == ""
+        assert status["context_threshold_source"] == "env:LCM_CONTEXT_THRESHOLD"
+        assert status["post_compaction_target_ratio_source"] == (
+            "env:LCM_POST_COMPACTION_TARGET_RATIO"
+        )
+    finally:
+        engine.shutdown()
+
+
+def test_lcm_model_policy_fields_fall_back_independently_and_override_host_map(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        post_compaction_target_ratio=0.3,
+        model_policies={
+            "threshold-only-model": {"context_threshold": 0.4},
+            "target-only-model": {"post_compaction_target_ratio": 0.1},
+        },
+        database_path=str(tmp_path / "lcm-independent-policy-fields.db"),
+    )
+    engine = LCMEngine(config=config)
+    engine.model_thresholds = {
+        "threshold-only-model": 0.6,
+        "target-only-model": 0.5,
+    }
+    try:
+        engine.update_model("threshold-only-model", 1_000_000, provider="provider")
+        status = engine.get_status()
+        assert status["context_threshold"] == 0.4
+        assert status["post_compaction_target_ratio"] == 0.3
+        assert status["matched_model_policy_key"] == "threshold-only-model"
+        assert status["context_threshold_source"].endswith(
+            ":threshold-only-model.context_threshold"
+        )
+
+        engine.update_model("target-only-model", 1_000_000, provider="provider")
+        status = engine.get_status()
+        assert status["context_threshold"] == 0.5
+        assert status["post_compaction_target_ratio"] == 0.1
+        assert status["matched_model_policy_key"] == "target-only-model"
+        assert status["context_threshold_source"].endswith(":target-only-model")
+        assert status["post_compaction_target_ratio_source"].endswith(
+            ":target-only-model.post_compaction_target_ratio"
+        )
+    finally:
+        engine.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("first_model", "second_model", "expected_threshold", "expected_target", "expected_key"),
+    [
+        ("deepseek-v4-flash", "some-other-model", 0.85, 0.3, ""),
+        ("some-other-model", "deepseek-v4-flash", 0.4, 0.1, "deepseek-v4-flash"),
+    ],
+)
+def test_session_start_zero_window_recalculates_model_policy_for_new_route(
+    tmp_path,
+    first_model,
+    second_model,
+    expected_threshold,
+    expected_target,
+    expected_key,
+):
+    config = LCMConfig(
+        context_threshold=0.85,
+        post_compaction_target_ratio=0.3,
+        max_assembly_tokens=12_345,
+        model_policies={
+            "deepseek-v4-flash": {
+                "context_threshold": 0.4,
+                "post_compaction_target_ratio": 0.1,
+            }
+        },
+        database_path=str(tmp_path / "lcm-zero-window-model-policy.db"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.on_session_start(
+            "session-1",
+            model=first_model,
+            provider="provider-1",
+            context_length=1_000_000,
+        )
+        engine.on_session_start(
+            "session-2",
+            model=second_model,
+            provider="provider-2",
+            context_length=0,
+        )
+
+        status = engine.get_status()
+        assert status["context_length"] == 0
+        assert status["threshold_tokens"] == 0
+        assert status["context_threshold"] == expected_threshold
+        assert status["post_compaction_target_ratio"] == expected_target
+        assert status["matched_model_policy_key"] == expected_key
+    finally:
+        engine.shutdown()
+
+
+def test_update_model_invalid_window_recalculates_policy_without_changing_window(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        post_compaction_target_ratio=0.3,
+        model_policies={
+            "deepseek-v4-flash": {
+                "context_threshold": 0.4,
+                "post_compaction_target_ratio": 0.1,
+            }
+        },
+        database_path=str(tmp_path / "lcm-invalid-window-model-policy.db"),
+    )
+    engine = LCMEngine(config=config)
+    try:
+        engine.update_model("deepseek-v4-flash", 1_000_000, provider="provider-1")
+        engine.update_model("some-other-model", "invalid", provider="provider-2")
+
+        status = engine.get_status()
+        assert status["context_length"] == 1_000_000
+        assert status["threshold_tokens"] == 850_000
+        assert status["context_threshold"] == 0.85
+        assert status["post_compaction_target_ratio"] == 0.3
+        assert status["matched_model_policy_key"] == ""
+    finally:
+        engine.shutdown()
+
+
+def test_update_model_applies_lcm_policy_loaded_from_hermes_config(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "lcm:\n"
+        "  model_policies:\n"
+        "    deepseek-v4-flash:\n"
+        "      context_threshold: 0.4\n"
+        "      post_compaction_target_ratio: 0.1\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    config = LCMConfig.from_env()
+    config.database_path = str(tmp_path / "lcm-model-policy-from-yaml.db")
+    engine = LCMEngine(config=config, hermes_home=str(hermes_home))
+    try:
+        engine.update_model(
+            model="deepseek-v4-flash",
+            provider="opencode-go",
+            context_length=1_000_000,
+        )
+
+        status = engine.get_status()
+        assert status["matched_model_policy_key"] == "deepseek-v4-flash"
+        assert status["context_threshold"] == 0.4
+        assert status["threshold_tokens"] == 400_000
+        assert status["post_compaction_target_ratio"] == 0.1
+        assert status["post_compaction_target_tokens"] == 100_000
+    finally:
+        engine.shutdown()
+
+
+def test_update_model_applies_hermes_per_model_threshold(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        database_path=str(tmp_path / "deepseek-model-threshold.db"),
+    )
+    config.config_sources["context_threshold"] = "env:LCM_CONTEXT_THRESHOLD"
+    engine = LCMEngine(config=config)
+    engine.model_thresholds = {"deepseek-v4-flash": 0.4}
+    try:
+        engine.update_model(
+            model="deepseek-v4-flash",
+            provider="opencode-go",
+            context_length=1_000_000,
+        )
+
+        assert engine.context_threshold == 0.4
+        assert engine.threshold_percent == 0.4
+        assert engine.threshold_tokens == 400_000
+        assert engine._context_threshold_source == (
+            "config_yaml:compression.model_thresholds:deepseek-v4-flash"
+        )
+    finally:
+        engine.shutdown()
+
+
+def test_update_model_uses_longest_matching_model_threshold(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        database_path=str(tmp_path / "longest-model-threshold.db"),
+    )
+    engine = LCMEngine(config=config)
+    engine.model_thresholds = {
+        "deepseek-v4": 0.4,
+        "deepseek-v4-flash": 0.3,
+    }
+    try:
+        engine.update_model(
+            model="deepseek-v4-flash-20260801",
+            provider="opencode-go",
+            context_length=1_000_000,
+        )
+
+        assert engine.context_threshold == 0.3
+        assert engine.threshold_tokens == 300_000
+        assert engine._context_threshold_source.endswith(":deepseek-v4-flash")
+    finally:
+        engine.shutdown()
+
+
+def test_update_model_restores_global_threshold_when_override_no_longer_matches(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        database_path=str(tmp_path / "restore-global-threshold.db"),
+    )
+    config.config_sources["context_threshold"] = "env:LCM_CONTEXT_THRESHOLD"
+    engine = LCMEngine(config=config)
+    engine.model_thresholds = {"deepseek-v4-flash": 0.4}
+    try:
+        engine.update_model(
+            model="deepseek-v4-flash",
+            provider="opencode-go",
+            context_length=1_000_000,
+        )
+        engine.update_model(
+            model="gpt-5.6-sol",
+            provider="openai-codex",
+            context_length=272_000,
+        )
+
+        assert engine.context_threshold == 0.85
+        assert engine.threshold_tokens == 231_200
+        assert engine._context_threshold_source == "env:LCM_CONTEXT_THRESHOLD"
+    finally:
+        engine.shutdown()
+
+
 def test_codex_gpt55_uses_route_cap_and_hermes_autoraise_threshold(tmp_path):
     config = LCMConfig(
         context_threshold=0.68,
@@ -11397,6 +11686,63 @@ class TestEngineCompress:
             assert telemetry["budget_exhausted"] is False
             assert telemetry["tokens_before"] == tokens_before
             assert telemetry["tokens_after"] < tokens_before
+        finally:
+            instance.shutdown()
+
+    def test_per_model_threshold_sweep_reaches_ten_percent_whole_request_target(
+        self, tmp_path, monkeypatch
+    ):
+        config = LCMConfig(
+            fresh_tail_count=2,
+            leaf_chunk_tokens=60_000,
+            dynamic_leaf_chunk_enabled=True,
+            threshold_only_compaction_enabled=True,
+            context_threshold=0.85,
+            post_compaction_target_ratio=0.3,
+            model_policies={
+                "deepseek-v4-flash": {
+                    "context_threshold": 0.4,
+                    "post_compaction_target_ratio": 0.1,
+                }
+            },
+            database_path=str(tmp_path / "lcm_deepseek_400k_to_100k.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "test-session"
+        instance.update_model(
+            model="deepseek-v4-flash",
+            provider="opencode-go",
+            context_length=1_000_000,
+        )
+        messages = [{"role": "system", "content": "system"}] + [
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"ITEM-{index} " + ("payload " * 18_000),
+            }
+            for index in range(20)
+        ]
+
+        def fake_leaf(chunk, focus_topic=None, deadline=None):
+            del focus_topic, deadline
+            source_tokens = count_messages_tokens(chunk)
+            labels = [str(message.get("content") or "").split()[0] for message in chunk]
+            return chunk, source_tokens, "retained " + " ".join(labels), 1, 0
+
+        monkeypatch.setattr(instance, "_summarize_leaf_chunk_with_rescue", fake_leaf)
+        try:
+            message_tokens_before = count_messages_tokens(messages)
+            observed_tokens = 400_000
+            compressed = instance.compress(messages, current_tokens=observed_tokens)
+            telemetry = instance.get_status()["threshold_full_sweep"]
+
+            assert 350_000 < message_tokens_before < observed_tokens
+            assert instance.threshold_tokens == 400_000
+            assert telemetry["tokens_before"] == 400_000
+            assert telemetry["post_compaction_target_tokens"] == 100_000
+            assert telemetry["tokens_after"] <= 100_000
+            assert telemetry["stop_reason"] == "post_compaction_target_reached"
+            assert telemetry["status"] == "completed"
+            assert compressed
         finally:
             instance.shutdown()
 

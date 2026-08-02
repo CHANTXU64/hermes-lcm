@@ -564,6 +564,7 @@ class TestConfig:
         assert c.threshold_full_sweep_enabled is False
         assert c.threshold_only_compaction_enabled is False
         assert c.post_compaction_target_ratio == 0.0
+        assert c.model_policies == {}
         assert c.summary_prefix_target_tokens == 0
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
@@ -682,6 +683,55 @@ class TestConfig:
         assert c.reserve_tokens_floor == 0
         assert c.expansion_context_tokens == 32_000
         assert c.critical_budget_pressure_ratio == 0.0
+
+    def test_from_env_reads_lcm_model_policy_with_trigger_and_target(
+        self, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n"
+            "  model_policies:\n"
+            "    deepseek-v4-flash:\n"
+            "      context_threshold: 0.4\n"
+            "      post_compaction_target_ratio: 0.1\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        c = LCMConfig.from_env()
+
+        assert c.model_policies == {
+            "deepseek-v4-flash": {
+                "context_threshold": 0.4,
+                "post_compaction_target_ratio": 0.1,
+            }
+        }
+        assert c.config_sources["model_policies"] == "config_yaml:lcm.model_policies"
+        assert "model_policies" not in c.ignored_config_yaml_lcm_keys
+
+    def test_from_env_rejects_model_policy_target_not_below_trigger(
+        self, monkeypatch, tmp_path
+    ):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "lcm:\n"
+            "  model_policies:\n"
+            "    deepseek-v4-flash:\n"
+            "      context_threshold: 0.4\n"
+            "      post_compaction_target_ratio: 0.5\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        c = LCMConfig.from_env()
+
+        assert c.model_policies == {
+            "deepseek-v4-flash": {"context_threshold": 0.4}
+        }
+        assert any(
+            "must be lower than context_threshold" in warning
+            for warning in c.config_source_warnings
+        )
 
     def test_from_env_reads_hermes_compression_threshold_when_lcm_env_missing(self, monkeypatch, tmp_path):
         hermes_home = tmp_path / "hermes"

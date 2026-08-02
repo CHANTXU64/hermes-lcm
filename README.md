@@ -410,10 +410,30 @@ unknown names, source, and placeholder format without exposing raw secret values
 
 ### Threshold ownership
 
-When `context.engine: lcm` is active, `LCM_CONTEXT_THRESHOLD` is the compaction
-threshold LCM uses. Hermes core `compression.threshold` belongs to the built-in
-compressor. Hermes core `compression.enabled` is still the global gate that
-allows compaction, so leave it enabled when using LCM.
+When `context.engine: lcm` is active, LCM resolves its global trigger from
+`LCM_CONTEXT_THRESHOLD`, then `lcm.context_threshold`, then Hermes
+`compression.threshold`. Hermes core `compression.enabled` is still the global
+gate that allows compaction, so leave it enabled when using LCM.
+
+Use `lcm.model_policies` when different models need independent LCM trigger and
+post-compaction target ratios. Keys use longest-substring matching and the
+policy is recalculated on every model switch:
+
+```yaml
+lcm:
+  model_policies:
+    deepseek-v4-flash:
+      context_threshold: 0.40
+      post_compaction_target_ratio: 0.10
+```
+
+For a 1M-token runtime this example triggers at 400K tokens and sets a
+best-effort 100K whole-request target. `lcm_status` reports the matched key,
+both effective ratios, their sources, and both token values. Models with no
+match continue through normal LCM resolution: the post target uses its global
+value, while the trigger can still come from Hermes
+`compression.model_thresholds` before falling back to the global LCM trigger.
+That shared Hermes map has no post-target field.
 
 If startup/status output shows a host-side compression percentage that disagrees
 with LCM, trust live LCM status after a normal message has initialized the

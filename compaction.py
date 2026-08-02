@@ -32,6 +32,8 @@ _THRESHOLD_FULL_SWEEP_MAX_SECONDS = 120.0
 
 
 class CompactionMixin:
+    post_compaction_target_ratio: float
+
     def _threshold_full_sweep_policy_enabled(self) -> bool:
         return bool(
             self._config.threshold_full_sweep_enabled
@@ -46,7 +48,7 @@ class CompactionMixin:
         )
 
     def _post_compaction_target_tokens(self) -> int:
-        ratio = float(self._config.post_compaction_target_ratio)
+        ratio = float(self.post_compaction_target_ratio)
         if (
             not math.isfinite(ratio)
             or ratio <= 0
@@ -610,7 +612,7 @@ class CompactionMixin:
                 "summary_prefix_tokens_before": sweep_summary_prefix_before,
                 "summary_prefix_tokens_after": sweep_summary_prefix_before,
                 "summary_prefix_target_tokens": sweep_target_tokens,
-                "post_compaction_target_ratio": self._config.post_compaction_target_ratio,
+                "post_compaction_target_ratio": self.post_compaction_target_ratio,
                 "post_compaction_target_tokens": post_compaction_target_tokens,
                 "stop_reason": "",
                 "budget_exhausted": False,
@@ -1205,7 +1207,7 @@ class CompactionMixin:
                 "summary_prefix_tokens_before": sweep_summary_prefix_before,
                 "summary_prefix_tokens_after": self._summary_frontier_tokens(),
                 "summary_prefix_target_tokens": sweep_target_tokens,
-                "post_compaction_target_ratio": self._config.post_compaction_target_ratio,
+                "post_compaction_target_ratio": self.post_compaction_target_ratio,
                 "post_compaction_target_tokens": post_compaction_target_tokens,
                 "stop_reason": final_stop_reason,
                 "budget_exhausted": final_stop_reason

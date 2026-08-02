@@ -102,6 +102,39 @@ def test_lcm_status_json_reports_runtime_context_indicators(engine):
     assert payload["threshold_tokens"] == int(200000 * engine._config.context_threshold)
 
 
+def test_lcm_status_json_reports_model_policy_trigger_and_target(tmp_path):
+    config = LCMConfig(
+        context_threshold=0.85,
+        post_compaction_target_ratio=0.3,
+        model_policies={
+            "deepseek-v4-flash": {
+                "context_threshold": 0.4,
+                "post_compaction_target_ratio": 0.1,
+            }
+        },
+        database_path=str(tmp_path / "lcm_policy_status.db"),
+    )
+    engine = LCMEngine(config=config)
+    engine._session_id = "test-session"
+    engine._session_platform = "telegram"
+    try:
+        engine.update_model("deepseek-v4-flash", 1_000_000, provider="opencode-go")
+
+        payload = json.loads(lcm_tools.lcm_status({}, engine=engine))
+        text_status = handle_lcm_command("", engine)
+
+        assert payload["matched_model_policy_key"] == "deepseek-v4-flash"
+        assert payload["context_threshold"] == 0.4
+        assert payload["threshold_tokens"] == 400_000
+        assert payload["post_compaction_target_ratio"] == 0.1
+        assert payload["post_compaction_target_tokens"] == 100_000
+        assert "matched_model_policy_key: deepseek-v4-flash" in text_status
+        assert "post_compaction_target_ratio: 0.1" in text_status
+        assert "post_compaction_target_tokens: 100000" in text_status
+    finally:
+        engine.shutdown()
+
+
 def test_lcm_status_uses_dag_aggregates_without_loading_all_nodes(engine, monkeypatch):
     engine._dag.add_node(SummaryNode(
         session_id="test-session",

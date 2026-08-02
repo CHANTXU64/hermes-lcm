@@ -1,5 +1,6 @@
 """LCM configuration with defaults and env var overrides."""
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -199,7 +200,8 @@ def _load_hermes_config_yaml() -> dict[str, Any]:
     return root
 
 
-_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold"}
+_SUPPORTED_LCM_CONFIG_YAML_KEYS = {"context_threshold", "model_policies"}
+_MODEL_POLICY_FIELDS = {"context_threshold", "post_compaction_target_ratio"}
 
 
 def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str]:
@@ -212,6 +214,82 @@ def _ignored_lcm_config_yaml_keys(cfg: dict[str, Any] | None = None) -> list[str
         for key in lcm_section
         if str(key) not in _SUPPORTED_LCM_CONFIG_YAML_KEYS
     )
+
+
+def _lcm_model_policies_with_source() -> tuple[
+    dict[str, dict[str, float]], str, list[str]
+]:
+    """Read and validate ``lcm.model_policies`` from Hermes config.yaml."""
+    cfg = _load_hermes_config_yaml()
+    lcm_section = cfg.get("lcm") if isinstance(cfg, dict) else None
+    raw_policies = lcm_section.get("model_policies") if isinstance(lcm_section, dict) else None
+    if raw_policies is None:
+        return {}, "default", []
+    source = "config_yaml:lcm.model_policies"
+    if not isinstance(raw_policies, dict):
+        return {}, source, ["invalid lcm.model_policies ignored: expected a mapping"]
+
+    policies: dict[str, dict[str, float]] = {}
+    warnings: list[str] = []
+    for raw_key, raw_policy in raw_policies.items():
+        key = str(raw_key).strip()
+        if not key:
+            warnings.append("invalid lcm.model_policies entry ignored: empty model key")
+            continue
+        if not isinstance(raw_policy, dict):
+            warnings.append(
+                f"invalid lcm.model_policies.{key} ignored: expected a mapping"
+            )
+            continue
+        unknown_fields = sorted(
+            str(field)
+            for field in raw_policy
+            if str(field) not in _MODEL_POLICY_FIELDS
+        )
+        if unknown_fields:
+            warnings.append(
+                f"unknown lcm.model_policies.{key} fields ignored: "
+                f"{', '.join(unknown_fields)}"
+            )
+        parsed_policy: dict[str, float] = {}
+        for policy_field in _MODEL_POLICY_FIELDS:
+            if policy_field not in raw_policy:
+                continue
+            raw_value = raw_policy[policy_field]
+            if isinstance(raw_value, bool):
+                warnings.append(
+                    f"invalid lcm.model_policies.{key}.{policy_field}={raw_value!r} ignored"
+                )
+                continue
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                warnings.append(
+                    f"invalid lcm.model_policies.{key}.{policy_field}={raw_value!r} ignored"
+                )
+                continue
+            minimum_ok = (
+                value > 0 if policy_field == "context_threshold" else value >= 0
+            )
+            if not math.isfinite(value) or not minimum_ok or value >= 1:
+                warnings.append(
+                    f"invalid lcm.model_policies.{key}.{policy_field}={raw_value!r} ignored"
+                )
+                continue
+            parsed_policy[policy_field] = value
+        trigger = parsed_policy.get("context_threshold")
+        target = parsed_policy.get("post_compaction_target_ratio")
+        if trigger is not None and target is not None and target >= trigger:
+            parsed_policy.pop("post_compaction_target_ratio", None)
+            warnings.append(
+                f"invalid lcm.model_policies.{key}.post_compaction_target_ratio="
+                f"{target!r} ignored: must be lower than context_threshold"
+            )
+        if parsed_policy:
+            policies[key] = parsed_policy
+        elif not unknown_fields:
+            warnings.append(f"empty lcm.model_policies.{key} ignored")
+    return policies, source, warnings
 
 
 def _hermes_compression_threshold(default: float) -> float:
@@ -462,6 +540,8 @@ class LCMConfig:
     threshold_only_compaction_enabled: bool = False
     # Best-effort whole provider-request target after a threshold sweep.
     post_compaction_target_ratio: float = 0.0
+    # Longest-substring model overrides for the LCM trigger and post target.
+    model_policies: dict[str, dict[str, float]] = field(default_factory=dict)
     # Target frontier-summary size after a sweep (0 = derive one leaf budget).
     summary_prefix_target_tokens: int = 0
 
@@ -696,6 +776,9 @@ class LCMConfig:
                 config_source_warnings.append(warning)
 
         c.ignored_config_yaml_lcm_keys = _ignored_lcm_config_yaml_keys()
+        c.model_policies, source, warnings = _lcm_model_policies_with_source()
+        _record("model_policies", source)
+        config_source_warnings.extend(warnings)
 
         # Source-tracked fields (provenance recording and/or a computed default)
         # stay explicit; the uniform loop below skips them.

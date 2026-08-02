@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -252,6 +253,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             else "manual_or_default"
         )
         self._context_threshold_autoraised: dict[str, float] | None = None
+        self.post_compaction_target_ratio = self._config.post_compaction_target_ratio
+        self._post_compaction_target_ratio_source = (
+            self._config.config_sources.get(
+                "post_compaction_target_ratio", "manual_or_default"
+            )
+            if getattr(self._config, "config_sources", None)
+            else "manual_or_default"
+        )
+        self._matched_model_policy_key = ""
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
@@ -560,6 +570,75 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         logger.info("LCM rebound storage for Hermes home %s", hermes_home)
         return True
 
+    def _matched_lcm_model_policy(
+        self, model: str | None = None
+    ) -> tuple[str, dict[str, float]]:
+        route_model = self.model if model is None else model
+        policies = getattr(self._config, "model_policies", {}) or {}
+        matching_keys = [
+            str(key)
+            for key in policies
+            if str(key) and str(key) in str(route_model or "")
+        ]
+        if not matching_keys:
+            return "", {}
+        matched_key = max(matching_keys, key=len)
+        policy = policies.get(matched_key)
+        return matched_key, policy if isinstance(policy, dict) else {}
+
+    def _runtime_post_compaction_target_ratio(
+        self, model: str | None = None
+    ) -> tuple[float, str, str]:
+        matched_key, policy = self._matched_lcm_model_policy(model)
+        model_target = policy.get("post_compaction_target_ratio")
+        if model_target is not None:
+            target = float(model_target)
+            if math.isfinite(target) and 0 <= target < 1:
+                return (
+                    target,
+                    "config_yaml:lcm.model_policies:"
+                    f"{matched_key}.post_compaction_target_ratio",
+                    matched_key,
+                )
+        source = (
+            self._config.config_sources.get(
+                "post_compaction_target_ratio", "manual_or_default"
+            )
+            if getattr(self._config, "config_sources", None)
+            else "manual_or_default"
+        )
+        return float(self._config.post_compaction_target_ratio), source, matched_key
+
+    def _apply_runtime_post_compaction_target(self, model: str | None = None) -> None:
+        (
+            self.post_compaction_target_ratio,
+            self._post_compaction_target_ratio_source,
+            self._matched_model_policy_key,
+        ) = self._runtime_post_compaction_target_ratio(model)
+
+    def _apply_runtime_model_policy(
+        self,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+    ) -> None:
+        (
+            self.context_threshold,
+            self._context_threshold_source,
+            self._context_threshold_autoraised,
+        ) = self._runtime_context_threshold(model=model, provider=provider)
+        self.threshold_percent = self.context_threshold
+        self._apply_runtime_post_compaction_target(model)
+        if self.context_length <= 0:
+            self.threshold_tokens = 0
+            return
+        context_threshold_tokens = int(
+            self.context_length * self.context_threshold
+        )
+        self.threshold_tokens = self._effective_threshold_tokens(
+            context_threshold_tokens
+        )
+
     def _runtime_context_threshold(
         self,
         *,
@@ -578,6 +657,32 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         }
         route_model = self.model if model is None else model
         route_provider = self.provider if provider is None else provider
+        matched_policy_key, model_policy = self._matched_lcm_model_policy(route_model)
+        lcm_model_threshold = model_policy.get("context_threshold")
+        if lcm_model_threshold is not None:
+            threshold = float(lcm_model_threshold)
+            if math.isfinite(threshold) and 0 < threshold < 1:
+                return (
+                    threshold,
+                    "config_yaml:lcm.model_policies:"
+                    f"{matched_policy_key}.context_threshold",
+                    None,
+                )
+        model_thresholds = getattr(self, "model_thresholds", {})
+        matching_keys = [
+            str(key)
+            for key in model_thresholds
+            if str(key) and str(key) in str(route_model or "")
+        ]
+        if matching_keys:
+            matched_key = max(matching_keys, key=len)
+            model_threshold = float(model_thresholds[matched_key])
+            if math.isfinite(model_threshold) and 0 < model_threshold < 1:
+                return (
+                    model_threshold,
+                    f"config_yaml:compression.model_thresholds:{matched_key}",
+                    None,
+                )
         if (
             _is_codex_gpt55_route(route_model, route_provider)
             and self._config.codex_gpt55_autoraise_enabled
@@ -649,11 +754,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             self.effective_context_length_cap = None
             self.effective_context_length_reason = ""
             self._context_length_source = source
-            self.threshold_tokens = 0
-            self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
-                self._runtime_context_threshold(model=model, provider=provider)
-            )
-            self.threshold_percent = self.context_threshold
+            self._apply_runtime_model_policy(model=model, provider=provider)
             return True
         self.raw_context_length = parsed_context_length
         effective_context_length, cap, reason = self._effective_context_length(
@@ -665,16 +766,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.effective_context_length_cap = cap
         self.effective_context_length_reason = reason
         self._context_length_source = source
-        self.context_threshold, self._context_threshold_source, self._context_threshold_autoraised = (
-            self._runtime_context_threshold(model=model, provider=provider)
-        )
-        self.threshold_percent = self.context_threshold
-        context_threshold_tokens = int(
-            effective_context_length * self.context_threshold
-        )
-        self.threshold_tokens = self._effective_threshold_tokens(
-            context_threshold_tokens
-        )
+        self._apply_runtime_model_policy(model=model, provider=provider)
         return True
 
     def _session_metadata_matches_active_runtime(
@@ -1792,7 +1884,12 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
                         )
                     self._update_model_pending_session_start = False
                     return
-                self._set_context_length(parsed_context_length, source="session_start")
+                self._set_context_length(
+                    parsed_context_length,
+                    source="session_start",
+                    model=str(kwargs.get("model") or self.model),
+                    provider=str(kwargs.get("provider") or self.provider),
+                )
                 update_model_is_authoritative = False
             else:
                 if (
@@ -3425,6 +3522,15 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             "context_threshold": self.context_threshold,
             "context_threshold_source": self._context_threshold_source,
             "context_threshold_autoraised": self._context_threshold_autoraised,
+            "configured_post_compaction_target_ratio": (
+                self._config.post_compaction_target_ratio
+            ),
+            "post_compaction_target_ratio": self.post_compaction_target_ratio,
+            "post_compaction_target_ratio_source": (
+                self._post_compaction_target_ratio_source
+            ),
+            "post_compaction_target_tokens": self._post_compaction_target_tokens(),
+            "matched_model_policy_key": self._matched_model_policy_key,
             "config_sources": dict(getattr(self._config, "config_sources", {}) or {}),
             "config_source_warnings": list(getattr(self._config, "config_source_warnings", []) or []),
             "ignored_config_yaml_lcm_keys": list(getattr(self._config, "ignored_config_yaml_lcm_keys", []) or []),
@@ -3547,7 +3653,11 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         self.api_key = str(api_key or "")
         self.provider = str(provider or "")
         self.api_mode = str(api_mode or "")
-        self._set_context_length(context_length, source="update_model")
+        if not self._set_context_length(context_length, source="update_model"):
+            self._apply_runtime_model_policy(
+                model=self.model,
+                provider=self.provider,
+            )
         self._update_model_pending_session_start = True
 
     def _refresh_session_filters(self) -> None:
