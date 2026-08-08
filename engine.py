@@ -3739,7 +3739,7 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
         return self.carry_over_new_session_context(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [
+        schemas = [
             LCM_GREP,
             LCM_RECALL,
             LCM_QUERY_STATE,
@@ -3756,8 +3756,14 @@ class LCMEngine(CompactionMixin, ResetStateMixin, ReconcileMixin, AuxiliarySessi
             LCM_INSPECT,
             LCM_DOCTOR,
         ]
+        if not getattr(self._config, "recall_enabled", True):
+            schemas.remove(LCM_RECALL)
+        return schemas
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
+        if name == "lcm_recall" and not getattr(self._config, "recall_enabled", True):
+            return json.dumps({"error": "lcm_recall is disabled by LCM_RECALL_ENABLED"})
+
         # Ingest live messages if passed (enables current-turn search)
         messages = kwargs.get("messages")
 

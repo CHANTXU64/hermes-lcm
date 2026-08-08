@@ -4587,6 +4587,8 @@ def lcm_recall(args: Dict[str, Any], **kwargs) -> str:
     engine = _require_engine(kwargs)
     if engine is None:
         return json.dumps({"error": "LCM engine not initialized"})
+    if not getattr(engine._config, "recall_enabled", True):
+        return json.dumps({"error": "lcm_recall is disabled by LCM_RECALL_ENABLED"})
 
     query = str(args.get("query", "")).strip()
     if not query:

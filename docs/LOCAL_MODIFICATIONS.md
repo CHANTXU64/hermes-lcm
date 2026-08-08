@@ -84,6 +84,56 @@ Feature docs: `docs/CHANTXU64/threshold-only-compaction/README.md`
 
 Upstream status: fork-only
 
+### 2. Configurable `lcm_recall` disable switch
+
+Status: active
+
+Files:
+
+- `config.py`
+- `engine.py`
+- `tools.py`
+- `tests/test_tool_contracts.py`
+- `docs/LOCAL_MODIFICATIONS.md`
+
+Summary:
+
+- Adds a default-on `LCM_RECALL_ENABLED` switch that can remove `lcm_recall` from the dynamic tool surface and reject direct or internal execution without disabling the rest of LCM.
+
+What changed:
+
+- `LCM_RECALL_ENABLED=false` is parsed into `LCMConfig.recall_enabled`.
+- Disabled engines omit `lcm_recall` from `get_tool_schemas()` and reject engine-dispatched calls before the handler runs.
+- The `lcm_recall` implementation also rejects direct/internal calls, preventing older cached schemas or indirect callers from bypassing the switch.
+- The default remains enabled for upstream-compatible behavior when the environment variable is unset.
+
+Why it matters:
+
+- Operators can retain LCM context management and other retrieval tools while disabling the experimental cross-conversation recall surface.
+
+Merge protection:
+
+- Preserve when: deployments still need to disable only `lcm_recall` without removing the full context-engine toolset.
+- Drop when: upstream provides an equivalent default-compatible switch that hides the schema and blocks both dispatch and direct/internal execution.
+- Ask user when: upstream changes dynamic tool registration, recall dispatch, or introduces a broader retrieval-disable policy with overlapping semantics.
+
+Verification:
+
+```bash
+/Users/robot/.hermes/hermes-agent/venv/bin/python -m pytest -q \
+  tests/test_tool_contracts.py \
+  tests/test_lcm_recall.py
+/Users/robot/.hermes/hermes-agent/venv/bin/python -m ruff check \
+  config.py engine.py tools.py tests/test_tool_contracts.py
+/Users/robot/.hermes/hermes-agent/venv/bin/python -m py_compile \
+  config.py engine.py tools.py tests/test_tool_contracts.py
+git diff --check
+```
+
+Feature docs: none — the behavior is a small environment flag with complete merge guidance and regression coverage in this index.
+
+Upstream status: fork-only
+
 ## Historical / reverted modifications
 
 None.
@@ -96,6 +146,6 @@ None.
 
 ## Summary statistics
 
-- Active: 1
+- Active: 2
 - Reverted: 0
 - Obsolete: 0

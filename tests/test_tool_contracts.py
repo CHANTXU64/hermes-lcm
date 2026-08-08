@@ -3,6 +3,7 @@
 import ast
 import importlib
 import inspect
+import json
 import sys
 import textwrap
 from pathlib import Path
@@ -118,6 +119,64 @@ def _dispatch_tool_names() -> list[str]:
 def _assert_unique(surface: str, tool_names: list[str]) -> None:
     duplicates = sorted({name for name in tool_names if tool_names.count(name) > 1})
     assert duplicates == [], f"duplicate tools in {surface}: {duplicates}"
+
+
+def test_recall_feature_flag_defaults_on_and_parses_env(monkeypatch):
+    monkeypatch.delenv("LCM_RECALL_ENABLED", raising=False)
+    assert LCMConfig.from_env().recall_enabled is True
+
+    monkeypatch.setenv("LCM_RECALL_ENABLED", "false")
+    assert LCMConfig.from_env().recall_enabled is False
+
+
+def test_disabled_recall_is_not_exposed_in_engine_tool_schemas(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "recall-disabled-schema.db"),
+        recall_enabled=False,
+    )
+    engine = LCMEngine(config=config)
+    try:
+        tool_names = [schema["name"] for schema in engine.get_tool_schemas()]
+        assert "lcm_recall" not in tool_names
+        assert "lcm_grep" in tool_names
+    finally:
+        engine.shutdown()
+
+
+def test_disabled_recall_engine_dispatch_rejects_without_running_handler(tmp_path, monkeypatch):
+    config = LCMConfig(
+        database_path=str(tmp_path / "recall-disabled-dispatch.db"),
+        recall_enabled=False,
+    )
+    engine = LCMEngine(config=config)
+    handler_called = False
+
+    def unexpected_handler(*args, **kwargs):
+        del args, kwargs
+        nonlocal handler_called
+        handler_called = True
+        raise AssertionError("disabled lcm_recall handler must not run")
+
+    monkeypatch.setattr(lcm_tools, "lcm_recall", unexpected_handler)
+    try:
+        response = json.loads(engine.handle_tool_call("lcm_recall", {"query": "needle"}))
+        assert response == {"error": "lcm_recall is disabled by LCM_RECALL_ENABLED"}
+        assert handler_called is False
+    finally:
+        engine.shutdown()
+
+
+def test_disabled_recall_internal_call_is_rejected(tmp_path):
+    config = LCMConfig(
+        database_path=str(tmp_path / "recall-disabled-internal.db"),
+        recall_enabled=False,
+    )
+    engine = LCMEngine(config=config)
+    try:
+        response = json.loads(lcm_tools.lcm_recall({"query": "needle"}, engine=engine))
+        assert response == {"error": "lcm_recall is disabled by LCM_RECALL_ENABLED"}
+    finally:
+        engine.shutdown()
 
 
 def test_public_tool_names_are_synchronized_across_contract_surfaces(tmp_path):

@@ -451,6 +451,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("database_path", "LCM_DATABASE_PATH", str),
     _EnvFieldSpec("embeddings_enabled", "LCM_EMBEDDINGS_ENABLED", bool),
     _EnvFieldSpec("rerank_enabled", "LCM_RERANK_ENABLED", bool),
+    _EnvFieldSpec("recall_enabled", "LCM_RECALL_ENABLED", bool),
     _EnvFieldSpec("recall_scan_rows", "LCM_RECALL_SCAN_ROWS", int),
     _EnvFieldSpec("recall_scan_max_rows", "LCM_RECALL_SCAN_MAX_ROWS", int),
     _EnvFieldSpec("recall_scan_budget_s", "LCM_RECALL_SCAN_BUDGET_S", float),
@@ -720,6 +721,10 @@ class LCMConfig:
     # rescore) KNN: M = knn_prescreen_multiplier x k survivors are rescored.
     # Larger widens the approximate prescreen toward exact recall at more cost.
     knn_prescreen_multiplier: int = 4
+    # Expose and execute the cross-conversation lcm_recall tool. Default-on
+    # preserves the historical public tool surface; set LCM_RECALL_ENABLED=false
+    # to remove the schema and reject direct/internal calls.
+    recall_enabled: bool = True
     # lcm_recall candidate-scan BATCH SIZE. lcm_recall promises "all
     # conversations, all time", so it must NOT inherit the small
     # recency-truncating grep bound above (that structurally hides the oldest
